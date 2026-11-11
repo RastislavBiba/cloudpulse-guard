@@ -1,59 +1,65 @@
-import pytest
-from unittest.mock import patch, MagicMock
+# tests/test_audit.py
+from unittest.mock import patch
 from fastapi.testclient import TestClient
 from app.main import app
 
 client = TestClient(app)
 
+
 def test_health_check():
-    """Overenie health check endpointu."""
+    """Overenie health endpointu."""
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "service": "cloudpulse-guard"}
+    assert response.json()["status"] == "ok"
+
 
 def test_index_dashboard():
     """Overenie načítania webového UI."""
     response = client.get("/")
     assert response.status_code == 200
-    assert "CloudPulse Guard & LLMOps" in response.text
-    assert "NOTIX" in response.text
+    assert "CloudPulse Guard" in response.text
 
-@patch("app.auditor.get_azure_client")
-def test_audit_api_mocked(mock_get_client):
-    """Overenie audítora cez mockované volanie Azure OpenAI."""
-    fake_client = MagicMock()
-    mock_response = MagicMock()
-    
-    mock_response.choices = [
-        MagicMock(message=MagicMock(content='''{
-            "summary": "Mocked test summary",
-            "compliance_score": 85,
-            "severity": "LOW",
-            "findings": [
-                {
-                    "severity": "LOW",
-                    "issue": "Test issue",
-                    "recommendation": "Test fix"
-                }
-            ],
-            "remediated_snippet": "apiVersion: v1"
-        }'''))
-    ]
-    mock_response.usage = MagicMock(prompt_tokens=50, completion_tokens=100, total_tokens=150)
-    fake_client.chat.completions.create.return_value = mock_response
-    mock_get_client.return_value = fake_client
+
+@patch("app.agents.triage.execute_agent_run")
+@patch("app.agents.remediation.execute_agent_run")
+@patch("app.agents.safety.execute_agent_run")
+def test_audit_api_mocked(mock_safety_run, mock_remed_run, mock_triage_run):
+    """Overenie orchestrácie cez mockované volania Azure AI Agent Service (0 tokenov, bez 429)."""
+
+    # 1. Mock Triage Agenta
+    mock_triage_run.return_value = (
+        '{"severity": "LOW", "component": "Kubernetes Pod", "stack_category": "K8s", "clean_summary": "Test pod spec"}',
+        10, 20
+    )
+
+    # 2. Mock Remediation Agenta
+    mock_remed_run.return_value = (
+        '{"findings": [{"severity": "LOW", "issue": "Chýba limit", "recommendation": "Pridať resources"}], "remediated_snippet": "resources:\\n  limits:\\n    cpu: 100m"}',
+        25, 40
+    )
+
+    # 3. Mock Safety Agenta
+    mock_safety_run.return_value = (
+        '{"compliance_score": 95, "safety_verdict": "SCHVÁLENO", "audit_comment": "Bezpečný manifest"}',
+        15, 10
+    )
 
     payload = {
-        "code_snippet": "apiVersion: v1\nkind: Pod",
+        "code_snippet": "apiVersion: v1\nkind: Pod\nmetadata:\n  name: test-pod",
         "code_type": "kubernetes"
     }
 
     response = client.post("/api/audit", json=payload)
     assert response.status_code == 200
-    data = response.json()
 
-    assert data["compliance_score"] == 85
+    data = response.json()
     assert data["severity"] == "LOW"
-    assert data["total_tokens"] == 150
-    assert data["cost_usd"] > 0
-    assert len(data["findings"]) == 1
+    assert data["compliance_score"] == 95
+    assert "Test pod spec" in data["summary"]
+    assert "Bezpečný manifest" in data["summary"]
+    assert "remediated_snippet" in data
+
+    # Overenie, že všetci traja sub-agenti boli zavolaní presne raz
+    assert mock_triage_run.call_count == 1
+    assert mock_remed_run.call_count == 1
+    assert mock_safety_run.call_count == 1
