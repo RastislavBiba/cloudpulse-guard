@@ -41,7 +41,6 @@ jobs:
         AZURE_AGENT_SAFETY_ID: "asst_mock_safety"
       run: |
         pytest -v
-  
 
   docker-build:
     name: Build & Push Docker Image to GHCR
