@@ -35,8 +35,13 @@ jobs:
         AZURE_AI_ENDPOINT: "https://mock-endpoint.services.ai.azure.com/openai/v1"
         AZURE_AI_API_KEY: "mock-key-for-ci"
         AZURE_AI_DEPLOYMENT_NAME: "gpt-5-mini"
+        AZURE_AI_PROJECT_ENDPOINT: "https://mock-endpoint.services.ai.azure.com/api/projects/mock"
+        AZURE_AGENT_TRIAGE_ID: "asst_mock_triage"
+        AZURE_AGENT_REMEDIATION_ID: "asst_mock_remediation"
+        AZURE_AGENT_SAFETY_ID: "asst_mock_safety"
       run: |
         pytest -v
+  
 
   docker-build:
     name: Build & Push Docker Image to GHCR
