@@ -1,23 +1,31 @@
-from fastapi import FastAPI
+import traceback
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from app.schemas import AuditRequest, AuditResult
-from app.agents.orchestrator import orchestrate_multi_agent_audit
+from app.auditor import run_infrastructure_audit
 from app.ui import get_dashboard_html
 
-app = FastAPI(
-    title="CloudPulse Guard",
-    description="Multi-Agent SRE Incident & Cloud Security Platform napojená na Azure AI Foundry",
-    version="2.0.0"
-)
-
-@app.get("/health")
-def health_check():
-    return {"status": "ok", "service": "cloudpulse-guard"}
+app = FastAPI(title="CloudPulse Guard", version="1.0.0")
 
 @app.get("/", response_class=HTMLResponse)
 def index():
     return get_dashboard_html()
 
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "cloudpulse-guard"}
+
 @app.post("/api/audit", response_model=AuditResult)
 def audit_endpoint(request: AuditRequest):
-    return orchestrate_multi_agent_audit(request)
+    try:
+        return run_infrastructure_audit(request)
+    except Exception as e:
+        print("\n" + "="*60)
+        print("💥 DETAIL CHYBY V CLOUD AGENTOCH:")
+        traceback.print_exc()
+        print("="*60 + "\n")
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)

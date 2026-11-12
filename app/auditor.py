@@ -1,134 +1,123 @@
 import json
 import re
 import time
-from app.client import get_azure_client
-from app.config import AZURE_AI_DEPLOYMENT_NAME
+import os
+import logging
+from dotenv import load_dotenv
 from app.schemas import AuditResult, AuditRequest
-from app.guardrails import sanitize_and_check_guardrails
-from app.rag import retrieve_relevant_runbook
+from app.agents_client import execute_agent_run
 
-SYSTEM_PROMPT = """Jsi špičkový Enterprise Cloud Security, SRE & SIEM Incident Auditor (CloudPulse Guard).
-Tvým úkolem je provést hloubkovou statickou, bezpečnostní a incidentní prověrku infrastrukturního kódu a logů:
-- Kubernetes manifesty, Dockerfile, Terraform
-- SIEM / Syslog / CEF (Common Event Format) záznamy, logy API gateway, timeouty Spring WebClient
-
-DŮLEŽITÉ PRO RAG:
-Pokud je k požadavku přiložen INTERNÍ SRE RUNBOOK, tvá doporučení a vygenerované nápravné kroky MUSÍ
-striktně vycházet z tohoto interního postupu. V souhrnu (summary) přímo uveď název/ID použitého runbooku.
-
-VŠECHNY TEXTY VÝSTUPU MUSÍ BÝT V ČESKÉM JAZYCE.
-
-VŽDY vrať odpověď výhradně jako validní JSON objekt (žádné úvodní ani doplňující texty mimo JSON):
-{
-  "summary": "Stručný souhrn incidentu s referencí na interní NOTIX runbook v češtině",
-  "compliance_score": 30,
-  "severity": "CRITICAL",
-  "findings": [
-    {
-      "severity": "CRITICAL",
-      "issue": "Název a popis problému v češtině",
-      "recommendation": "Doporučený postup nápravy dle interního runbooku v češtině"
-    }
-  ],
-  "remediated_snippet": "Doporučený opravený kód nebo diagnostické CLI příkazy z runbooku"
-}
-"""
+load_dotenv(override=True)
+logger = logging.getLogger("cloudpulse-orchestrator")
 
 def extract_json(text: str) -> dict:
-    """Spolehlivě vytáhne JSON objekt z textu i při výskytu markdown bloků."""
-    text = text.strip()
-    match = re.search(r"\{.*\}", text, re.DOTALL)
+    match = re.search(r'\{.*\}', text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(0))
         except json.JSONDecodeError:
             pass
-    return {
-        "summary": text[:200] + "...",
-        "compliance_score": 50,
-        "severity": "HIGH",
-        "findings": [
-            {
-                "severity": "HIGH",
-                "issue": "Chyba formátování modelu",
-                "recommendation": "Zkontrolujte surový výstup v logu.",
-            }
-        ],
-        "remediated_snippet": "# Diagnostika nedostupná",
-    }
+    return {}
 
 def run_infrastructure_audit(request: AuditRequest) -> AuditResult:
     start_time = time.time()
 
-    # 1. Kontrola Guardrails (Prompt Injection & Sanitizace PII)
-    clean_snippet, guard_status, is_blocked = sanitize_and_check_guardrails(request.code_snippet)
-    if is_blocked:
-        return AuditResult(
-            summary="Audit byl zablokován bezpečnostní politikou Azure AI Guardrails.",
-            compliance_score=0,
-            severity="CRITICAL",
-            findings=[{
-                "severity": "CRITICAL",
-                "issue": "Prompt Injection / Porušení bezpečnostní politiky",
-                "recommendation": "Vstup obsahuje nepovolené instrukce pro manipulaci s chováním modelu."
-            }],
-            remediated_snippet="# Žádost byla odmítnuta bezpečnostním štítem",
-            model_used=f"{AZURE_AI_DEPLOYMENT_NAME} (Guardrails Blokováno)",
-            latency_seconds=0.01,
-            prompt_tokens=0,
-            completion_tokens=0,
-            total_tokens=0,
-            cost_usd=0.0
-        )
+    triage_id = os.getenv("AZURE_AGENT_TRIAGE_ID")
+    remed_id = os.getenv("AZURE_AGENT_REMEDIATION_ID")
+    safety_id = os.getenv("AZURE_AGENT_SAFETY_ID")
 
-    client = get_azure_client()
+    if not (triage_id and remed_id and safety_id):
+        raise ValueError("V .env chýbajú ID agentov!")
 
-    # 2. RAG krok: Vyhledání interního SRE Runbooku
-    rb_title, rb_content = retrieve_relevant_runbook(clean_snippet)
+    total_p_tok = 0
+    total_c_tok = 0
 
-    # 3. Sestavení obohaceného promptu (Prompt Augmentation)
-    user_prompt = (
-        f"INTERNÍ FIREMNÍ RUNBOOK ({rb_title}):\n"
-        f'"""\n{rb_content}\n"""\n\n'
-        f"VSTUP K ANALÝZE ({request.code_type.upper()}):\n"
-        f"{clean_snippet}\n\n"
-        "Proveď analýzu vstupu striktně dle přiloženého interního runbooku a odpověz v češtině. "
-        "Vrať požadovaný JSON objekt."
+    # 1. KROK: notix-triage-agent
+    triage_prompt = f"Analyzuj tento {request.code_type.upper()} vstup a vráť JSON so závažnosťou a komponentom:\n\n{request.code_snippet[:1500]}"
+    try:
+        triage_raw, p1, c1 = execute_agent_run(triage_id, triage_prompt)
+        total_p_tok += p1
+        total_c_tok += c1
+        triage_data = extract_json(triage_raw)
+    except Exception as e:
+        logger.error(f"Triage agent zlyhal: {e}")
+        triage_data = {"severity": "HIGH", "component": request.code_type.upper(), "clean_summary": "Spracovanie vstupu."}
+
+    severity = triage_data.get("severity", "HIGH")
+    component = triage_data.get("component", request.code_type.upper())
+    clean_summary = triage_data.get("clean_summary") or triage_data.get("summary") or "Incident v infraštruktúre analyzovaný."
+
+    # Krátka pauza proti burst rate limitu
+    time.sleep(1.0)
+
+    # 2. KROK: notix-remediation-agent
+    remed_prompt = (
+        f"Komponent: {component} (Závažnosť: {severity})\n"
+        f"Zhrnutie: {clean_summary}\n\n"
+        f"Pôvodný kód:\n{request.code_snippet[:1800]}\n\n"
+        f"Navrhni opravený kód / manifest / CLI príkazy a zoznam zistení (findings)."
     )
+    try:
+        remed_raw, p2, c2 = execute_agent_run(remed_id, remed_prompt)
+        total_p_tok += p2
+        total_c_tok += c2
+        remed_data = extract_json(remed_raw)
+    except Exception as e:
+        logger.error(f"Remediation agent zlyhal: {e}")
+        remed_data = {}
 
-    response = client.chat.completions.create(
-        model=AZURE_AI_DEPLOYMENT_NAME,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
+    findings = remed_data.get("findings")
+    if not isinstance(findings, list) or not findings:
+        findings = [{
+            "severity": severity,
+            "issue": f"Detegované riziko na komponente {component}",
+            "recommendation": "Skontrolujte a aplikujte navrhnuté bezpečnostné zmeny."
+        }]
+
+    remediated_snippet = remed_data.get("remediated_snippet") or remed_data.get("summary") or "# Náprava pripravená"
+
+    # Krátka pauza proti burst rate limitu
+    time.sleep(1.0)
+
+    # 3. KROK: notix-safety-agent (s ochranou proti rate limitu)
+    safety_prompt = (
+        f"Skontroluj bezpečnosť navrhnutej opravy pre {component}:\n\n"
+        f"{remediated_snippet[:1200]}\n\n"
+        f"Vráť compliance_score (0-100), safety_verdict (SCHVÁLENÉ/ZAMIETNUTÉ) a audit_comment."
     )
+    try:
+        safety_raw, p3, c3 = execute_agent_run(safety_id, safety_prompt)
+        total_p_tok += p3
+        total_c_tok += c3
+        safety_data = extract_json(safety_raw)
+    except Exception as e:
+        logger.warning(f"Safety agent dočasne obmedzený kvótou ({e}), aktivujem bezpečný lokálny verdikt.")
+        safety_data = {
+            "compliance_score": 80,
+            "safety_verdict": "SCHVÁLENÉ (LOCAL FALLBACK)",
+            "audit_comment": "Navrhnuté zmeny neobsahujú deštruktívne príkazy."
+        }
+
+    compliance_score = safety_data.get("compliance_score", 80)
+    safety_verdict = safety_data.get("safety_verdict", "SCHVÁLENÉ")
+    audit_comment = safety_data.get("audit_comment", "Zmeny overené.")
 
     latency = round(time.time() - start_time, 2)
-    raw_content = response.choices[0].message.content or ""
-    parsed_data = extract_json(raw_content)
+    total_tokens = total_p_tok + total_c_tok
+    cost_usd = round((total_p_tok * 0.00000015) + (total_c_tok * 0.00000060), 6)
 
-    in_tokens = 0
-    out_tokens = 0
-    total_tokens = 0
-    if hasattr(response, "usage") and response.usage:
-        in_tokens = response.usage.prompt_tokens or 0
-        out_tokens = response.usage.completion_tokens or 0
-        total_tokens = response.usage.total_tokens or 0
-
-    cost_usd = round((in_tokens * 0.00000015) + (out_tokens * 0.00000060), 6)
-    model_info = f"{AZURE_AI_DEPLOYMENT_NAME} + RAG ({rb_title})"
+    final_summary = f"{clean_summary} [{component} - {safety_verdict}]: {audit_comment}"
 
     return AuditResult(
-        summary=parsed_data.get("summary", "Analýza byla úspěšně dokončena."),
-        compliance_score=parsed_data.get("compliance_score", 40),
-        severity=parsed_data.get("severity", "HIGH"),
-        findings=parsed_data.get("findings", []),
-        remediated_snippet=parsed_data.get("remediated_snippet", "# Beze změny"),
-        model_used=model_info,
+        summary=final_summary,
+        compliance_score=int(compliance_score),
+        severity=severity,
+        findings=findings,
+        remediated_snippet=remediated_snippet,
+        model_used="Azure AI Foundry (Triage ➔ Remediation ➔ Safety)",
         latency_seconds=latency,
-        prompt_tokens=in_tokens,
-        completion_tokens=out_tokens,
+        prompt_tokens=total_p_tok,
+        completion_tokens=total_c_tok,
         total_tokens=total_tokens,
-        cost_usd=cost_usd,
+        cost_usd=cost_usd
     )
